@@ -87,11 +87,20 @@ serve(async (req) => {
 
       const subscriptions = [];
 
+
+
+      const productCache = new Map<string, Stripe.Product>();
+
+codex/find-deployment-steps-for-vercel-vz83zf
       for (const customer of customers.data) {
         const subscriptionList = await stripe.subscriptions.list({
           customer: customer.id,
           status: 'all',
+
           expand: ['data.items.data.price.product'],
+
+          expand: ['data.items.data.price'],
+codex/find-deployment-steps-for-vercel-vz83zf
           limit: 100,
         });
 
@@ -100,10 +109,25 @@ serve(async (req) => {
             product?: Stripe.Product | string;
           };
 
+
           const product =
             price?.product && typeof price.product !== 'string'
               ? price.product
               : undefined;
+
+          let product: Stripe.Product | undefined;
+
+          if (price?.product && typeof price.product !== 'string') {
+            product = price.product;
+          } else if (price?.product && typeof price.product === 'string') {
+            const productId = price.product;
+            if (!productCache.has(productId)) {
+              const fetchedProduct = await stripe.products.retrieve(productId);
+              productCache.set(productId, fetchedProduct);
+            }
+            product = productCache.get(productId);
+          }
+codex/find-deployment-steps-for-vercel-vz83zf
 
           subscriptions.push({
             stripe_customer_id: customer.id,
