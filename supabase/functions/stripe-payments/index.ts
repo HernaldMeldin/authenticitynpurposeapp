@@ -87,66 +87,23 @@ serve(async (req) => {
 
       const subscriptions = [];
 
-      const priceCache = new Map<string, Stripe.Price>();
-      const productCache = new Map<string, Stripe.Product>();
-
-      const resolvePrice = async (
-        priceCandidate: string | Stripe.Price | null | undefined,
-      ): Promise<Stripe.Price | undefined> => {
-        if (!priceCandidate) return undefined;
-
-        if (typeof priceCandidate === 'string') {
-          if (!priceCache.has(priceCandidate)) {
-            const fetchedPrice = await stripe.prices.retrieve(priceCandidate);
-            priceCache.set(priceCandidate, fetchedPrice);
-          }
-          return priceCache.get(priceCandidate);
-        }
-
-        const priceObject = priceCandidate as Stripe.Price;
-        if (priceObject.id && !priceCache.has(priceObject.id)) {
-          priceCache.set(priceObject.id, priceObject);
-        }
-        return priceObject;
-      };
-
-      const resolveProduct = async (
-        price: Stripe.Price | undefined,
-      ): Promise<Stripe.Product | undefined> => {
-        if (!price?.product) return undefined;
-
-        if (typeof price.product !== 'string') {
-          const productObject = price.product as Stripe.Product;
-          if (productObject.id && !productCache.has(productObject.id)) {
-            productCache.set(productObject.id, productObject);
-          }
-          return productObject;
-        }
-
-        const productId = price.product;
-        if (!productCache.has(productId)) {
-          const fetchedProduct = await stripe.products.retrieve(productId);
-          productCache.set(productId, fetchedProduct);
-        }
-        return productCache.get(productId);
-      };
-
       for (const customer of customers.data) {
         const subscriptionList = await stripe.subscriptions.list({
           customer: customer.id,
           status: 'all',
+          expand: ['data.items.data.price.product'],
           limit: 100,
-          expand: [],
         });
 
         for (const subscription of subscriptionList.data) {
-          const primaryItem =
-            subscription.items.data.find((item) => !!item.price) ??
-            subscription.items.data[0];
+          const price = subscription.items.data[0]?.price as Stripe.Price & {
+            product?: Stripe.Product | string;
+          };
 
-          const price = await resolvePrice(primaryItem?.price ?? null);
-          const product = await resolveProduct(price);
-          const fallbackPlan = primaryItem?.plan;
+          const product =
+            price?.product && typeof price.product !== 'string'
+              ? price.product
+              : undefined;
 
           subscriptions.push({
             stripe_customer_id: customer.id,
@@ -154,14 +111,10 @@ serve(async (req) => {
             status: subscription.status,
             price_id: price?.id ?? null,
             plan_id: price?.id ?? null,
-            plan_name:
-              product?.name ?? price?.nickname ?? fallbackPlan?.nickname ?? null,
-            plan_amount:
-              price?.unit_amount ?? fallbackPlan?.amount ?? null,
-            plan_currency:
-              price?.currency ?? fallbackPlan?.currency ?? null,
-            plan_interval:
-              price?.recurring?.interval ?? fallbackPlan?.interval ?? null,
+            plan_name: product?.name ?? price?.nickname ?? null,
+            plan_amount: price?.unit_amount ?? null,
+            plan_currency: price?.currency ?? null,
+            plan_interval: price?.recurring?.interval ?? null,
             current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
             current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
             trial_start: subscription.trial_start
