@@ -212,6 +212,31 @@ Use this optional smoke test to confirm the `sync-subscriptions` Edge Function c
 
 ---
 
+## Part 5b: Verify Stripe → Supabase Sync (10 minutes)
+
+Use this optional smoke test to confirm the `sync-subscriptions` Edge Function can pull active subscriptions from Stripe into your Supabase table.
+
+1. **Seed a test customer in Stripe**
+   - Complete the checkout flow above or create a subscription manually in the Stripe dashboard using the same email address as your Supabase user.
+   - Ensure the customer has at least one active or trialing subscription so it appears in Stripe search results.
+2. **Sign in to the troubleshooting page**
+   - Run the app locally (`npm run dev`) or open your deployed environment.
+   - Log in with the Supabase user that matches the Stripe customer email.
+   - Navigate to `/test-subscriptions` (the "Test Subscriptions" helper page).
+3. **Trigger a sync from the browser**
+   - Click **"Sync from Stripe"**.
+   - The page calls the `stripe-payments` Edge Function with `action: 'sync-subscriptions'` and includes your session token automatically.
+   - A successful sync shows a toast such as "Synced 1 subscription(s) from Stripe" and refreshes the subscription card.
+4. **Inspect Supabase data**
+   - Open the Supabase dashboard → **Table editor → subscriptions**.
+   - You should see an entry whose `stripe_subscription_id`, `status`, and billing details match the Stripe record.
+5. **Troubleshoot failures**
+   - Check the browser console/network tab for the JSON error returned by the function.
+   - Visit Supabase → **Edge Functions → stripe-payments → Logs** for detailed stack traces if the function responded with a non-2xx status.
+   - Confirm the secrets `STRIPE_SECRET_KEY`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY` are present under **Settings → Edge Functions → Manage Secrets**.
+
+---
+
 ## Part 7: Webhook Setup (Advanced)
 
 Create `supabase/functions/stripe-webhooks/index.ts` to handle subscription updates automatically.
