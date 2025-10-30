@@ -181,6 +181,10 @@ priceId: 'price_1DEF456...',  // Your Annual price ID (line 60)
 **Subscription not saving**
 - Set up webhook handler (see Part 7)
 
+**Latest code not running**
+- Re-deploy the Edge Function after making changes: `supabase functions deploy stripe-payments`
+- Confirm the deployment finished under Supabase → **Edge Functions → Deployments**
+
 ---
 
 ## Part 5b: Verify Stripe → Supabase Sync (10 minutes)
