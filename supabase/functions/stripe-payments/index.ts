@@ -13,14 +13,17 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 serve(async (req) => {
   try {
-    const { action, priceId, successUrl, cancelUrl, subscriptionId } = await req.json();
+    const { action, priceId, successUrl, cancelUrl, subscriptionId, userEmail } = await req.json();
+
+    const authHeader = req.headers.get('Authorization');
+    const token = authHeader?.replace('Bearer ', '');
 
     if (action === 'create-checkout-session') {
-      // Get or create customer
-      const authHeader = req.headers.get('Authorization');
-      const token = authHeader?.replace('Bearer ', '');
-      
-      const { data: { user } } = await supabase.auth.getUser(token!);
+      if (!token) {
+        throw new Error('User not authenticated');
+      }
+
+      const { data: { user } } = await supabase.auth.getUser(token);
       if (!user) throw new Error('User not authenticated');
 
       // Check for existing customer
@@ -54,6 +57,118 @@ serve(async (req) => {
         headers: { 'Content-Type': 'application/json' },
         status: 200,
       });
+    }
+
+    if (action === 'sync-subscriptions') {
+      if (!token) {
+        throw new Error('User not authenticated');
+      }
+
+      const { data: { user } } = await supabase.auth.getUser(token);
+      if (!user) {
+        throw new Error('User not authenticated');
+      }
+
+      const emailToLookup = (userEmail || user.email)?.toLowerCase();
+      if (!emailToLookup) {
+        throw new Error('User email is required');
+      }
+
+      if (user.email && user.email.toLowerCase() !== emailToLookup) {
+        throw new Error('User email does not match authenticated user');
+      }
+
+      const sanitizedEmail = emailToLookup.replace(/'/g, "\\'");
+
+      const customers = await stripe.customers.search({
+        query: `email:'${sanitizedEmail}'`,
+        limit: 10,
+      });
+
+      const subscriptions = [];
+
+      const priceCache = new Map<string, Stripe.Price>();
+      const productCache = new Map<string, Stripe.Product>();
+
+      for (const customer of customers.data) {
+        const subscriptionList = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: 'all',
+          limit: 100,
+        });
+
+        for (const subscription of subscriptionList.data) {
+          const priceRef = subscription.items.data[0]?.price;
+          let price: Stripe.Price | undefined;
+
+          if (typeof priceRef === 'string') {
+            if (!priceCache.has(priceRef)) {
+              const fetchedPrice = await stripe.prices.retrieve(priceRef);
+              priceCache.set(priceRef, fetchedPrice);
+            }
+            price = priceCache.get(priceRef);
+          } else if (priceRef) {
+            price = priceRef as Stripe.Price;
+            if (price?.id && !priceCache.has(price.id)) {
+              priceCache.set(price.id, price);
+            }
+          }
+
+          let product: Stripe.Product | undefined;
+
+          if (price?.product && typeof price.product !== 'string') {
+            product = price.product;
+            if (product?.id && !productCache.has(product.id)) {
+              productCache.set(product.id, product);
+            }
+          } else if (price?.product && typeof price.product === 'string') {
+            const productId = price.product;
+            if (!productCache.has(productId)) {
+              const fetchedProduct = await stripe.products.retrieve(productId);
+              productCache.set(productId, fetchedProduct);
+            }
+            product = productCache.get(productId);
+          }
+
+          subscriptions.push({
+            stripe_customer_id: customer.id,
+            stripe_subscription_id: subscription.id,
+            status: subscription.status,
+            price_id: price?.id ?? null,
+            plan_id: price?.id ?? null,
+            plan_name: product?.name ?? price?.nickname ?? null,
+            plan_amount: price?.unit_amount ?? null,
+            plan_currency: price?.currency ?? null,
+            plan_interval: price?.recurring?.interval ?? null,
+            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            trial_start: subscription.trial_start
+              ? new Date(subscription.trial_start * 1000).toISOString()
+              : null,
+            trial_end: subscription.trial_end
+              ? new Date(subscription.trial_end * 1000).toISOString()
+              : null,
+            cancel_at_period_end: subscription.cancel_at_period_end ?? false,
+            created_at: new Date(subscription.created * 1000).toISOString(),
+            updated_at: new Date().toISOString(),
+            tier: subscription.metadata?.tier ?? null,
+            features: subscription.metadata?.features ?? null,
+            limits: subscription.metadata?.limits ?? null,
+          });
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          synced: subscriptions.length,
+          subscriptions,
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
     }
 
     if (action === 'cancel-subscription') {
