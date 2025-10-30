@@ -2,7 +2,9 @@ import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import Stripe from 'https://esm.sh/stripe@14.21.0?target=deno';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.3';
 
-const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') || '', {
+const stripeSecretKey = Deno.env.get('STRIPE_SECRET_KEY') || '';
+
+const stripe = new Stripe(stripeSecretKey, {
   apiVersion: '2023-10-16',
   httpClient: Stripe.createFetchHttpClient(),
 });
@@ -13,14 +15,24 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 serve(async (req) => {
   try {
-    const { action, priceId, successUrl, cancelUrl, subscriptionId } = await req.json();
+    const {
+      action,
+      priceId,
+      successUrl,
+      cancelUrl,
+      subscriptionId,
+      userEmail,
+    } = await req.json();
+
+    const authHeader = req.headers.get('Authorization');
+    const token = authHeader?.replace('Bearer ', '');
 
     if (action === 'create-checkout-session') {
-      // Get or create customer
-      const authHeader = req.headers.get('Authorization');
-      const token = authHeader?.replace('Bearer ', '');
-      
-      const { data: { user } } = await supabase.auth.getUser(token!);
+      if (!token) {
+        throw new Error('User not authenticated');
+      }
+
+      const { data: { user } } = await supabase.auth.getUser(token);
       if (!user) throw new Error('User not authenticated');
 
       // Check for existing customer
@@ -56,6 +68,194 @@ serve(async (req) => {
       });
     }
 
+    if (action === 'sync-subscriptions') {
+      if (!token) {
+        throw new Error('User not authenticated');
+      }
+
+      const { data: { user } } = await supabase.auth.getUser(token);
+      if (!user) {
+        throw new Error('User not authenticated');
+      }
+
+      const escapeStripeSearchTerm = (value: string) =>
+        value
+          .replace(/\\/g, '\\\\')
+          .replace(/'/g, "\\'")
+          .replace(/([+\-&|!(){}\[\]^"~*?:\/])/g, '\\$1');
+
+      const emailToLookup = (userEmail || user.email)?.toLowerCase();
+      if (!emailToLookup) {
+        throw new Error('User email is required');
+      }
+
+      if (user.email && user.email.toLowerCase() !== emailToLookup) {
+        throw new Error('User email does not match authenticated user');
+      }
+
+      const sanitizedEmail = escapeStripeSearchTerm(emailToLookup);
+
+      const customers = await stripe.customers.search({
+        query: `email:'${sanitizedEmail}'`,
+        limit: 10,
+      });
+
+      const subscriptions = [];
+
+      const priceCache = new Map<string, Stripe.Price>();
+      const productCache = new Map<string, Stripe.Product>();
+
+      const resolvePrice = async (
+        priceCandidate: string | Stripe.Price | null | undefined,
+      ): Promise<Stripe.Price | undefined> => {
+        if (!priceCandidate) return undefined;
+
+        if (typeof priceCandidate === 'string') {
+          if (!priceCache.has(priceCandidate)) {
+            const fetchedPrice = await stripe.prices.retrieve(priceCandidate);
+            priceCache.set(priceCandidate, fetchedPrice);
+          }
+          return priceCache.get(priceCandidate);
+        }
+
+        const priceObject = priceCandidate as Stripe.Price;
+        if (priceObject.id && !priceCache.has(priceObject.id)) {
+          priceCache.set(priceObject.id, priceObject);
+        }
+        return priceObject;
+      };
+
+      const resolveProduct = async (
+        price: Stripe.Price | undefined,
+      ): Promise<Stripe.Product | undefined> => {
+        if (!price?.product) return undefined;
+
+        if (typeof price.product !== 'string') {
+          const productObject = price.product as Stripe.Product;
+          if (productObject.id && !productCache.has(productObject.id)) {
+            productCache.set(productObject.id, productObject);
+          }
+          return productObject;
+        }
+
+        const productId = price.product;
+        if (!productCache.has(productId)) {
+          const fetchedProduct = await stripe.products.retrieve(productId);
+          productCache.set(productId, fetchedProduct);
+        }
+        return productCache.get(productId);
+      };
+
+      for (const customer of customers.data) {
+        let subscriptionList: Stripe.ApiList<Stripe.Subscription>;
+
+        try {
+          subscriptionList = await stripe.subscriptions.list({
+            customer: customer.id,
+            status: 'all',
+            limit: 100,
+          });
+        } catch (err) {
+          const stripeError = err as Stripe.errors.StripeError & {
+            code?: string;
+            raw?: { requestId?: string };
+          };
+
+          if (stripeError?.code === 'property_expansion_max_depth') {
+            if (!stripeSecretKey) {
+              throw err;
+            }
+
+            console.warn(
+              'Retrying subscription list without expansions due to depth limit',
+              stripeError?.raw?.requestId ?? 'unknown-request',
+            );
+
+            const fallbackParams = new URLSearchParams({
+              customer: customer.id,
+              status: 'all',
+              limit: '100',
+            });
+
+            const fallbackResponse = await fetch(
+              `https://api.stripe.com/v1/subscriptions?${fallbackParams.toString()}`,
+              {
+                method: 'GET',
+                headers: {
+                  Authorization: `Bearer ${stripeSecretKey}`,
+                },
+              },
+            );
+
+            const fallbackPayload = await fallbackResponse.json();
+
+            if (!fallbackResponse.ok) {
+              const fallbackMessage =
+                fallbackPayload?.error?.message ??
+                `Stripe fallback request failed with status ${fallbackResponse.status}`;
+              throw new Error(fallbackMessage);
+            }
+
+            subscriptionList = fallbackPayload as Stripe.ApiList<Stripe.Subscription>;
+          } else {
+            throw err;
+          }
+        }
+
+        for (const subscription of subscriptionList.data) {
+          const primaryItem =
+            subscription.items.data.find((item) => !!item.price) ??
+            subscription.items.data[0];
+
+          const price = await resolvePrice(primaryItem?.price ?? null);
+          const product = await resolveProduct(price);
+          const fallbackPlan = primaryItem?.plan;
+
+          subscriptions.push({
+            stripe_customer_id: customer.id,
+            stripe_subscription_id: subscription.id,
+            status: subscription.status,
+            price_id: price?.id ?? null,
+            plan_id: price?.id ?? null,
+            plan_name:
+              product?.name ?? price?.nickname ?? fallbackPlan?.nickname ?? null,
+            plan_amount:
+              price?.unit_amount ?? fallbackPlan?.amount ?? null,
+            plan_currency:
+              price?.currency ?? fallbackPlan?.currency ?? null,
+            plan_interval:
+              price?.recurring?.interval ?? fallbackPlan?.interval ?? null,
+            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            trial_start: subscription.trial_start
+              ? new Date(subscription.trial_start * 1000).toISOString()
+              : null,
+            trial_end: subscription.trial_end
+              ? new Date(subscription.trial_end * 1000).toISOString()
+              : null,
+            cancel_at_period_end: subscription.cancel_at_period_end ?? false,
+            created_at: new Date(subscription.created * 1000).toISOString(),
+            updated_at: new Date().toISOString(),
+            tier: subscription.metadata?.tier ?? null,
+            features: subscription.metadata?.features ?? null,
+            limits: subscription.metadata?.limits ?? null,
+          });
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          synced: subscriptions.length,
+          subscriptions,
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    }
+
     if (action === 'cancel-subscription') {
       const subscription = await stripe.subscriptions.update(subscriptionId, {
         cancel_at_period_end: true
@@ -69,7 +269,13 @@ serve(async (req) => {
 
     throw new Error('Invalid action');
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
+    console.error('Stripe function error:', error);
+    const message =
+      error && typeof error === 'object' && 'message' in error
+        ? String(error.message)
+        : 'Unknown error';
+
+    return new Response(JSON.stringify({ error: message }), {
       headers: { 'Content-Type': 'application/json' },
       status: 400,
     });
